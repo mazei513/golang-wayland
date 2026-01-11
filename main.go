@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"path"
-	"runtime/trace"
 	"strconv"
 	"time"
 
@@ -17,15 +16,6 @@ import (
 )
 
 func main() {
-	traceFile, err := os.Create("trace.out")
-	if err != nil {
-		panic(err)
-	}
-	defer traceFile.Close()
-
-	trace.Start(traceFile)
-	defer trace.Stop()
-
 	ctx := context.Background()
 	socketPath := os.Getenv("WAYLAND_SOCKET")
 	xdgRuntimeDir := os.Getenv("XDG_RUNTIME_DIR")
@@ -82,16 +72,17 @@ loop:
 			case "wl_shm":
 				WLShmID = regObj(objWLShm)
 				mustBind(conn, name, WLShmID, ver, iface)
+			case "wl_output":
+				WLOutputID = regObj(objWLOutput)
+				mustBind(conn, name, WLOutputID, ver, iface)
 			case "xdg_wm_base":
 				XDGWMBaseID = regObj(objXDGWMBase)
 				mustBind(conn, name, XDGWMBaseID, ver, iface)
+			case "zwlr_layer_shell_v1":
+				ZWLRLayerShellID = regObj(objZWLRLayerShell)
+				mustBind(conn, name, ZWLRLayerShellID, ver, iface)
 			}
 		case callbackID: // wl_callback
-			if opcode != 0 {
-				slog.ErrorContext(ctx, "wl_callback unknown opcode", "opcode", opcode)
-				continue
-			}
-			// 		slog.InfoContext(ctx, "wl_callback::done")
 			break loop
 		default:
 			slog.InfoContext(ctx, "wl msg", "id", id, "opcode", opcode, "body", hex.EncodeToString(body))
@@ -114,17 +105,13 @@ loop2:
 		case WLDisplayID:
 			handleWLDisplayEvent(opcode, body)
 		case callbackID: // wl_callback
-			if opcode != 0 {
-				slog.ErrorContext(ctx, "wl_callback unknown opcode", "opcode", opcode)
-				continue
-			}
-			// 		slog.InfoContext(ctx, "wl_callback::done")
 			break loop2
 		default:
 			slog.InfoContext(ctx, "wl msg", "id", id, "opcode", opcode, "body", hex.EncodeToString(body))
 		}
 	}
 
+	mustFrame(conn)
 	mustAttach(conn)
 	mustDamage(conn)
 	mustCommit(conn)
@@ -139,28 +126,35 @@ loop3:
 			handleWLDisplayEvent(opcode, body)
 		case XDGWMBaseID:
 			if opcode != 0 {
+				slog.InfoContext(ctx, "xdg_wm_base", "id", id, "opcode", opcode, "body", hex.EncodeToString(body))
 				continue
 			}
 			serial := binary.LittleEndian.Uint32(body)
 			mustPong(conn, serial)
 		case XDGSurfaceID:
 			if opcode != 0 {
+				slog.InfoContext(ctx, "xdg_surface", "id", id, "opcode", opcode, "body", hex.EncodeToString(body))
 				continue
 			}
 			serial := binary.LittleEndian.Uint32(body)
 			mustAckConfigure(conn, serial)
+		case XDGTopLevelID:
+			if opcode != 1 {
+				slog.InfoContext(ctx, "xdg_top_level", "id", id, "opcode", opcode, "body", hex.EncodeToString(body))
+				continue
+			}
+			break loop3
+		case WLFrameCallbackID:
+			objects[WLFrameCallbackID] = objNone
+			WLFrameCallbackID = 0
+			mustFrame(conn)
+
 			for i := range WLShmPoolBuf {
-				WLShmPoolBuf[i] = ^WLShmPoolBuf[i]
+				WLShmPoolBuf[i] += 4
 			}
 			mustAttach(conn)
 			mustDamage(conn)
 			mustCommit(conn)
-		case XDGTopLevelID:
-			if opcode != 1 {
-				continue
-			}
-			// 		slog.InfoContext(ctx, "xdg_top_level::close get")
-			break loop3
 		default:
 			slog.InfoContext(ctx, "wl msg", "id", id, "opcode", opcode, "body", hex.EncodeToString(body))
 		}
@@ -177,11 +171,13 @@ const (
 	objWLCompositor
 	objWLShm
 	objWLShmPool
+	objWLOutput
 	objWLSurface
 	objWLBuffer
 	objXDGWMBase
 	objXDGSurface
 	objXDGTopLevel
+	objZWLRLayerShell
 )
 
 var objects = [1 << 8]objType{objNone, objWLDisplay, objWLRegistry}
@@ -204,14 +200,17 @@ const WLRegistryID = 2
 
 var (
 	// IDs
-	WLCompositorID uint32
-	WLShmID        uint32
-	WLShmPoolID    uint32
-	WLBufferID     uint32
-	WLSurfaceID    uint32
-	XDGWMBaseID    uint32
-	XDGSurfaceID   uint32
-	XDGTopLevelID  uint32
+	WLCompositorID    uint32
+	WLShmID           uint32
+	WLShmPoolID       uint32
+	WLOutputID        uint32
+	WLBufferID        uint32
+	WLSurfaceID       uint32
+	XDGWMBaseID       uint32
+	XDGSurfaceID      uint32
+	XDGTopLevelID     uint32
+	ZWLRLayerShellID  uint32
+	WLFrameCallbackID uint32
 
 	// WLShmPool stuff
 	WLShmPoolFile *os.File
@@ -267,7 +266,6 @@ func mustGetReg(conn *net.UnixConn) {
 	if err != nil {
 		panic(err)
 	}
-	// slog.InfoContext(ctx, "wl_display::get_registry done", "msg", hex.EncodeToString(msgBytes))
 }
 
 func mustSync(conn *net.UnixConn) (id uint32) {
@@ -278,7 +276,6 @@ func mustSync(conn *net.UnixConn) (id uint32) {
 	if err != nil {
 		panic(err)
 	}
-	// slog.InfoContext(ctx, "wl_display::sync done", "id", id, "msg", hex.EncodeToString(msgBytes))
 	return id
 }
 
@@ -299,7 +296,6 @@ func mustBind(conn *net.UnixConn, name, id, ver uint32, iface []byte) {
 	if err != nil {
 		panic(err)
 	}
-	// slog.InfoContext(ctx, "wl_registry::bind done", "name", name, "id", id, "iface", iface, "ver", ver, "msg", hex.EncodeToString(msgBytes))
 }
 
 func mustCreatePool(conn *net.UnixConn) {
@@ -327,7 +323,6 @@ func mustCreatePool(conn *net.UnixConn) {
 	if err != nil {
 		panic(err)
 	}
-	// slog.InfoContext(ctx, "wl_shm::create_pool done", "filename", WLShmPoolFile.Name(), "WLShmPoolID", WLShmPoolID, "msg", hex.EncodeToString(buf))
 }
 
 func mustCreateBuffer(conn *net.UnixConn) {
@@ -343,7 +338,6 @@ func mustCreateBuffer(conn *net.UnixConn) {
 	if err != nil {
 		panic(err)
 	}
-	// slog.InfoContext(ctx, "wl_shm_pool::create_buffer done", "WLBufferID", WLBufferID, "msg", hex.EncodeToString(buf))
 }
 func mustCreateSurface(conn *net.UnixConn) {
 	buf := makeMsgBuf(WLCompositorID, 0, WORD_SIZE)
@@ -353,7 +347,6 @@ func mustCreateSurface(conn *net.UnixConn) {
 	if err != nil {
 		panic(err)
 	}
-	// slog.InfoContext(ctx, "wl_compositor::create_surface done", "WLSurfaceID", WLSurfaceID, "msg", hex.EncodeToString(buf))
 }
 func mustAttach(conn *net.UnixConn) {
 	buf := makeMsgBuf(WLSurfaceID, 1, WORD_SIZE*3)
@@ -364,7 +357,6 @@ func mustAttach(conn *net.UnixConn) {
 	if err != nil {
 		panic(err)
 	}
-	// slog.InfoContext(ctx, "wl_surface::attach done", "msg", hex.EncodeToString(buf))
 }
 func mustDamage(conn *net.UnixConn) {
 	buf := makeMsgBuf(WLSurfaceID, 9, WORD_SIZE*4)
@@ -376,7 +368,6 @@ func mustDamage(conn *net.UnixConn) {
 	if err != nil {
 		panic(err)
 	}
-	// slog.InfoContext(ctx, "wl_surface::damage done", "msg", hex.EncodeToString(buf))
 }
 func mustCommit(conn *net.UnixConn) {
 	buf := makeMsgBuf(WLSurfaceID, 6, 0)
@@ -384,7 +375,15 @@ func mustCommit(conn *net.UnixConn) {
 	if err != nil {
 		panic(err)
 	}
-	// slog.InfoContext(ctx, "wl_surface::commit done", "msg", hex.EncodeToString(buf))
+}
+func mustFrame(conn *net.UnixConn) {
+	WLFrameCallbackID = regObj(objWLCallback)
+	buf := makeMsgBuf(WLSurfaceID, 3, WORD_SIZE)
+	buf = binary.LittleEndian.AppendUint32(buf, WLFrameCallbackID)
+	_, err := conn.Write(buf)
+	if err != nil {
+		panic(err)
+	}
 }
 func mustGetXDGSurface(conn *net.UnixConn) {
 	buf := makeMsgBuf(XDGWMBaseID, 2, WORD_SIZE*2)
@@ -395,7 +394,6 @@ func mustGetXDGSurface(conn *net.UnixConn) {
 	if err != nil {
 		panic(err)
 	}
-	// slog.InfoContext(ctx, "xdg_wm_base::get_xdg_surface done", "XDGSurfaceID", XDGSurfaceID, "msg", hex.EncodeToString(buf))
 }
 func mustGetTopLevel(conn *net.UnixConn) {
 	buf := makeMsgBuf(XDGSurfaceID, 1, WORD_SIZE)
@@ -405,7 +403,6 @@ func mustGetTopLevel(conn *net.UnixConn) {
 	if err != nil {
 		panic(err)
 	}
-	// slog.InfoContext(ctx, "xdg_surface::get_top_level done", "XDGTopLevelID", XDGTopLevelID, "msg", hex.EncodeToString(buf))
 }
 func mustAckConfigure(conn *net.UnixConn, serial uint32) {
 	buf := makeMsgBuf(XDGSurfaceID, 4, WORD_SIZE)
@@ -414,7 +411,6 @@ func mustAckConfigure(conn *net.UnixConn, serial uint32) {
 	if err != nil {
 		panic(err)
 	}
-	// slog.InfoContext(ctx, "xdg_surface::ack_configure done", "serial", serial, "msg", hex.EncodeToString(buf))
 }
 func mustPong(conn *net.UnixConn, serial uint32) {
 	buf := makeMsgBuf(XDGWMBaseID, 3, WORD_SIZE)
@@ -423,7 +419,6 @@ func mustPong(conn *net.UnixConn, serial uint32) {
 	if err != nil {
 		panic(err)
 	}
-	// slog.InfoContext(ctx, "xdg_wm_base::pong done", "serial", serial, "msg", hex.EncodeToString(buf))
 }
 
 func makeMsgBuf(id uint32, opcode uint16, dataLen uint32) []byte {
