@@ -42,7 +42,7 @@ func main() {
 	}
 
 	mustGetReg(conn)
-	callbackID := mustSync(conn)
+	mustSync(conn)
 
 loop:
 	for {
@@ -67,22 +67,17 @@ loop:
 			ver := binary.LittleEndian.Uint32(body[4+off:])
 			switch string(iface) {
 			case "wl_compositor":
-				WLCompositorID = regObj(objWLCompositor)
-				mustBind(conn, name, WLCompositorID, ver, iface)
+				WLCompositorID = mustRegBind(conn, objWLCompositor, name, ver, iface)
 			case "wl_shm":
-				WLShmID = regObj(objWLShm)
-				mustBind(conn, name, WLShmID, ver, iface)
+				WLShmID = mustRegBind(conn, objWLShm, name, ver, iface)
 			case "wl_output":
-				WLOutputID = regObj(objWLOutput)
-				mustBind(conn, name, WLOutputID, ver, iface)
+				WLOutputID = mustRegBind(conn, objWLOutput, name, ver, iface)
 			case "xdg_wm_base":
-				XDGWMBaseID = regObj(objXDGWMBase)
-				mustBind(conn, name, XDGWMBaseID, ver, iface)
+				XDGWMBaseID = mustRegBind(conn, objXDGWMBase, name, ver, iface)
 			case "zwlr_layer_shell_v1":
-				ZWLRLayerShellID = regObj(objZWLRLayerShell)
-				mustBind(conn, name, ZWLRLayerShellID, ver, iface)
+				ZWLRLayerShellID = mustRegBind(conn, objZWLRLayerShell, name, ver, iface)
 			}
-		case callbackID: // wl_callback
+		case WLSyncCallbackID:
 			break loop
 		default:
 			slog.InfoContext(ctx, "wl msg", "id", id, "opcode", opcode, "body", hex.EncodeToString(body))
@@ -94,7 +89,7 @@ loop:
 	mustGetTopLevel(conn)
 	mustCreatePool(conn)
 	mustCreateBuffer(conn)
-	callbackID = mustSync(conn)
+	mustSync(conn)
 loop2:
 	for {
 		id, opcode, body, err := read(conn)
@@ -104,7 +99,7 @@ loop2:
 		switch id {
 		case WLDisplayID:
 			handleWLDisplayEvent(opcode, body)
-		case callbackID: // wl_callback
+		case WLSyncCallbackID: // wl_callback
 			break loop2
 		default:
 			slog.InfoContext(ctx, "wl msg", "id", id, "opcode", opcode, "body", hex.EncodeToString(body))
@@ -180,12 +175,13 @@ const (
 	objZWLRLayerShell
 )
 
-var objects = [1 << 8]objType{objNone, objWLDisplay, objWLRegistry}
+const objectsLen = 1 << 8
+
+var objects = [objectsLen]objType{objNone, objWLDisplay, objWLRegistry}
 
 func regObj(t objType) (id uint32) {
 	id = 1
-	n := uint32(len(objects))
-	for id < n {
+	for id < objectsLen {
 		if objects[id] == 0 {
 			objects[id] = t
 			break
@@ -201,6 +197,7 @@ const WLRegistryID = 2
 var (
 	// IDs
 	WLCompositorID    uint32
+	WLSyncCallbackID  uint32
 	WLShmID           uint32
 	WLShmPoolID       uint32
 	WLOutputID        uint32
@@ -268,18 +265,18 @@ func mustGetReg(conn *net.UnixConn) {
 	}
 }
 
-func mustSync(conn *net.UnixConn) (id uint32) {
-	id = regObj(objWLCallback)
+func mustSync(conn *net.UnixConn) {
+	WLSyncCallbackID = regObj(objWLCallback)
 	msgBytes := makeMsgBuf(WLDisplayID, 0, WORD_SIZE)
-	msgBytes = binary.LittleEndian.AppendUint32(msgBytes, id)
+	msgBytes = binary.LittleEndian.AppendUint32(msgBytes, WLSyncCallbackID)
 	_, err := conn.Write(msgBytes)
 	if err != nil {
 		panic(err)
 	}
-	return id
 }
 
-func mustBind(conn *net.UnixConn, name, id, ver uint32, iface []byte) {
+func mustRegBind(conn *net.UnixConn, t objType, name, ver uint32, iface []byte) (id uint32) {
+	id = regObj(t)
 	strLen := uint32(len(iface) + 1)
 	padding := (4 - strLen%4) % 4
 	msgBytes := makeMsgBuf(WLRegistryID, 0, WORD_SIZE*4+strLen+padding)
@@ -296,6 +293,7 @@ func mustBind(conn *net.UnixConn, name, id, ver uint32, iface []byte) {
 	if err != nil {
 		panic(err)
 	}
+	return id
 }
 
 func mustCreatePool(conn *net.UnixConn) {
@@ -376,11 +374,18 @@ func mustCommit(conn *net.UnixConn) {
 		panic(err)
 	}
 }
+
+var wlFrameCallBuf []byte
+
 func mustFrame(conn *net.UnixConn) {
 	WLFrameCallbackID = regObj(objWLCallback)
-	buf := makeMsgBuf(WLSurfaceID, 3, WORD_SIZE)
-	buf = binary.LittleEndian.AppendUint32(buf, WLFrameCallbackID)
-	_, err := conn.Write(buf)
+	if wlFrameCallBuf == nil {
+		wlFrameCallBuf = makeMsgBuf(WLSurfaceID, 3, WORD_SIZE)
+		wlFrameCallBuf = binary.LittleEndian.AppendUint32(wlFrameCallBuf, WLFrameCallbackID)
+	} else {
+		binary.LittleEndian.PutUint32(wlFrameCallBuf[HEADER_SIZE:], WLFrameCallbackID)
+	}
+	_, err := conn.Write(wlFrameCallBuf)
 	if err != nil {
 		panic(err)
 	}
